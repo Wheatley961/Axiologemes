@@ -4,15 +4,16 @@ import numpy as np
 import os
 import re
 import itertools
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, ConvexHull
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import stanza
 import plotly.graph_objects as go
 import plotly.express as px
+from itertools import combinations
 
 # ==============================================================================
 # НАСТРОЙКА СТРАНИЦЫ И КЭШИРОВАНИЕ
@@ -114,7 +115,12 @@ cluster_points = {
     for ax in df["axiologeme"].unique()
 }
 
-color_palette = ["blue", "red", "green", "purple", "orange", "brown", "pink", "gray", "olive", "cyan"]
+# Контрастная палитра цветов (Plotly qualitative)
+color_palette = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    '#ff9896', '#98df8a', '#c5b0d5', '#c49c94', '#f7b6d2'
+]
 colors = {ax: color for ax, color in zip(df["axiologeme"].unique(), itertools.cycle(color_palette))}
 
 # 1. Расчёт проницаемости и внешней нагрузки
@@ -227,7 +233,7 @@ with tab2:
     for ax in df["axiologeme"].unique():
         subset = df[df["axiologeme"] == ax]
         hover_texts = [
-            f"<b>Аксиологема:</b> {ax}<br><b>Центр:</b> {c}<br><b>Контекст:</b> {ctx}"
+            f"<b>Аксиологема:</b> {ax}<br><b>Центр:</b> {c}<br><b>Контекст:</b> {ctx[:200]}..."
             for c, ctx in zip(subset["Center"], subset["full_context"])
         ]
         
@@ -235,7 +241,7 @@ with tab2:
         fig_3d.add_trace(go.Scatter3d(
             x=subset["x"], y=subset["y"], z=subset["z"],
             mode="markers",
-            marker=dict(size=3, color=colors[ax]),
+            marker=dict(size=4, color=colors[ax], line=dict(color='white', width=0.5)),
             text=hover_texts,
             hoverinfo="text",
             name=f"точки: {ax}"
@@ -245,13 +251,17 @@ with tab2:
         points = cluster_points[ax]
         if len(points) >= 4:
             try:
-                hull = Delaunay(points)
-                fig_3d.add_trace(go.Mesh3d(
-                    x=points[:, 0], y=points[:, 1], z=points[:, 2],
-                    i=hull.simplices[:, 0], j=hull.simplices[:, 1], k=hull.simplices[:, 2],
-                    opacity=0.15, color=colors[ax],
-                    name=f"границы: {ax}"
-                ))
+                hull = ConvexHull(points)
+                for simplex in hull.simplices:
+                    fig_3d.add_trace(go.Scatter3d(
+                        x=points[simplex, 0],
+                        y=points[simplex, 1],
+                        z=points[simplex, 2],
+                        mode='lines',
+                        line=dict(color=colors[ax], width=2),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
             except Exception:
                 pass
 
@@ -259,19 +269,20 @@ with tab2:
         title="3D-семантическое пространство контекстов",
         scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"),
         width=800, height=700,
-        legend=dict(title="Аксиологемы")
+        legend=dict(title="Аксиологемы"),
+        scene_bgcolor='white'
     )
     st.plotly_chart(fig_3d, use_container_width=True)
 
     st.subheader("Диахрония объёма аксиологем")
-    # Преобразование даты и группировка по годам (без анимации дрейфа, как и просили)
     df["Created"] = pd.to_datetime(df["Created"], errors="coerce")
     df["year"] = df["Created"].dt.year
     volume_time = df.groupby(["axiologeme", "year"]).size().reset_index(name="count")
     
     fig_line = px.line(
         volume_time, x="year", y="count", color="axiologeme",
-        title="Динамика объёма упоминаний аксиологем по годам", markers=True
+        title="Динамика объёма упоминаний аксиологем по годам", markers=True,
+        color_discrete_sequence=color_palette
     )
     fig_line.update_layout(xaxis_title="Год", yaxis_title="Количество употреблений")
     st.plotly_chart(fig_line, use_container_width=True)
@@ -292,8 +303,8 @@ with tab3:
             mode="markers+text",
             text=words,
             textposition="top center",
-            marker=dict(size=5, color=colors[ax]),
-            textfont=dict(size=10, color="black"),
+            marker=dict(size=6, color=colors[ax], line=dict(color='black', width=0.5)),
+            textfont=dict(size=9, color="black"),
             hoverinfo="text",
             hovertext=hover_words,
             name=ax
@@ -302,7 +313,8 @@ with tab3:
     fig_words.update_layout(
         title="3D-семантические поля аксиологем (Топ-50 слов)",
         scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"),
-        width=800, height=700
+        width=800, height=700,
+        scene_bgcolor='white'
     )
     st.plotly_chart(fig_words, use_container_width=True)
 
@@ -310,55 +322,152 @@ with tab3:
 with tab4:
     st.subheader("Автоматический анализ внутренней полисемии аксиологемы")
     target_ax = st.selectbox("Выберите аксиологему для кластеризации:", list(df["axiologeme"].unique()))
+    num_examples = st.slider("Количество примеров на кластер:", 5, 20, 10)
     
     if st.button("Запустить анализ полисемии"):
         df_sub = df[df["axiologeme"] == target_ax].copy()
         X = df_sub[["x", "y", "z"]].values
         
-        silhouette_scores = {}
-        for k in range(2, 6):
+        silhouette_scores_dict = {}
+        davies_bouldin_scores = {}
+        calinski_harabasz_scores = {}
+        
+        st.markdown("### 🔍 Подбор оптимального числа кластеров")
+        
+        for k in range(2, 9):  # Увеличено до 8 кластеров
             if len(X) <= k:
                 continue
             kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
             labels = kmeans.fit_predict(X)
-            score = silhouette_score(X, labels)
-            silhouette_scores[k] = score
             
-        if silhouette_scores:
-            optimal_k = max(silhouette_scores, key=silhouette_scores.get)
-            st.success(f"✅ Оптимальное число подкластеров (по силуэту): **{optimal_k}** (Score: {silhouette_scores[optimal_k]:.3f})")
+            sil_score = silhouette_score(X, labels)
+            db_score = davies_bouldin_score(X, labels)
+            ch_score = calinski_harabasz_score(X, labels)
             
-            # Пересчёт с оптимальным K
-            kmeans_final = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
-            df_sub["subcluster"] = kmeans_final.fit_predict(X)
+            silhouette_scores_dict[k] = sil_score
+            davies_bouldin_scores[k] = db_score
+            calinski_harabasz_scores[k] = ch_score
+        
+        # Создание таблицы метрик
+        metrics_df = pd.DataFrame({
+            'Число кластеров (K)': list(silhouette_scores_dict.keys()),
+            'Silhouette Score': [round(silhouette_scores_dict[k], 4) for k in silhouette_scores_dict],
+            'Davies-Bouldin Index': [round(davies_bouldin_scores[k], 4) for k in davies_bouldin_scores],
+            'Calinski-Harabasz Score': [round(calinski_harabasz_scores[k], 2) for k in calinski_harabasz_scores]
+        })
+        
+        st.dataframe(metrics_df, use_container_width=True)
+        
+        # Определение оптимального K по silhouette score
+        optimal_k = max(silhouette_scores_dict, key=silhouette_scores_dict.get)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Оптимальное K (Silhouette)", optimal_k, 
+                     f"{silhouette_scores_dict[optimal_k]:.3f}")
+        with col2:
+            st.metric("Davies-Bouldin (оптимальный K)", 
+                     f"{davies_bouldin_scores[optimal_k]:.3f}",
+                     "чем меньше, тем лучше")
+        with col3:
+            st.metric("Calinski-Harabasz (оптимальный K)", 
+                     f"{calinski_harabasz_scores[optimal_k]:.1f}",
+                     "чем больше, тем лучше")
+        
+        # График метрик
+        metrics_melted = metrics_df.melt(id_vars='Число кластеров (K)', 
+                                        value_vars=['Silhouette Score', 'Davies-Bouldin Index', 'Calinski-Harabasz Score'],
+                                        var_name='Метрика', value_name='Значение')
+        
+        fig_metrics = px.line(metrics_melted, x='Число кластеров (K)', y='Значение', 
+                             color='Метрика', markers=True,
+                             title="Метрики качества кластеризации")
+        st.plotly_chart(fig_metrics, use_container_width=True)
+        
+        # Финальная кластеризация с оптимальным K
+        kmeans_final = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+        df_sub["subcluster"] = kmeans_final.fit_predict(X)
+        
+        # Визуализация подкластеров с контрастными цветами
+        st.markdown("### 📊 3D-визуализация подкластеров")
+        
+        # Контрастная палитра для подкластеров
+        subcluster_colors = px.colors.qualitative.Set1 if optimal_k <= 9 else px.colors.qualitative.Plotly
+        
+        fig_poly = go.Figure()
+        
+        for cluster_id in range(optimal_k):
+            subset_c = df_sub[df_sub["subcluster"] == cluster_id]
+            color = subcluster_colors[cluster_id % len(subcluster_colors)]
             
-            # Визуализация подкластеров
-            fig_poly = go.Figure()
-            for cluster_id in range(optimal_k):
-                subset_c = df_sub[df_sub["subcluster"] == cluster_id]
-                fig_poly.add_trace(go.Scatter3d(
-                    x=subset_c["x"], y=subset_c["y"], z=subset_c["z"],
-                    mode="markers",
-                    marker=dict(size=4, color=colors[target_ax], opacity=0.6),
-                    name=f"Подкластер {cluster_id}"
-                ))
+            hover_texts = [
+                f"<b>Подкластер:</b> {cluster_id}<br>"
+                f"<b>Центр:</b> {c}<br>"
+                f"<b>Контекст:</b> {ctx[:250]}..."
+                for c, ctx in zip(subset_c["Center"], subset_c["full_context"])
+            ]
             
-            fig_poly.update_layout(
-                title=f"Внутренняя полисемия: «{target_ax}» (K={optimal_k})",
-                scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
-                height=600
-            )
-            st.plotly_chart(fig_poly, use_container_width=True)
+            fig_poly.add_trace(go.Scatter3d(
+                x=subset_c["x"], y=subset_c["y"], z=subset_c["z"],
+                mode="markers",
+                marker=dict(size=5, color=color, line=dict(color='white', width=0.5)),
+                text=hover_texts,
+                hoverinfo="text",
+                name=f"Подкластер {cluster_id}"
+            ))
             
-            # Примеры контекстов
-            st.markdown("#### Примеры контекстов по смысловым подтипам:")
-            for cluster_id in range(optimal_k):
-                with st.expander(f"📂 Подкластер {cluster_id}"):
-                    examples = df_sub[df_sub["subcluster"] == cluster_id].head(5)["full_context"].values
-                    for i, ctx in enumerate(examples, 1):
-                        st.markdown(f"{i}. *{ctx}*")
-        else:
-            st.warning("Недостаточно данных для кластеризации (требуется > 5 контекстов).")
+            # Границы кластеров (Convex Hull)
+            if len(subset_c) >= 4:
+                try:
+                    points = subset_c[["x", "y", "z"]].values
+                    hull = ConvexHull(points)
+                    for simplex in hull.simplices:
+                        fig_poly.add_trace(go.Scatter3d(
+                            x=points[simplex, 0],
+                            y=points[simplex, 1],
+                            z=points[simplex, 2],
+                            mode='lines',
+                            line=dict(color=color, width=2),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ))
+                except Exception:
+                    pass
+        
+        fig_poly.update_layout(
+            title=f"Внутренняя полисемия: «{target_ax}» (K={optimal_k})",
+            scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
+            height=700,
+            legend_title="Смысловые подтипы",
+            scene_bgcolor='white'
+        )
+        st.plotly_chart(fig_poly, use_container_width=True)
+        
+        # Примеры контекстов
+        st.markdown(f"### 📝 Примеры контекстов по смысловым подтипам (по {num_examples} примеров)")
+        
+        for cluster_id in range(optimal_k):
+            cluster_data = df_sub[df_sub["subcluster"] == cluster_id]
+            cluster_size = len(cluster_data)
+            
+            with st.expander(f"📂 Подкластер {cluster_id} (объём: {cluster_size} контекстов)", expanded=False):
+                st.markdown(f"**Размер кластера:** {cluster_size} контекстов ({cluster_size/len(df_sub)*100:.1f}%)")
+                
+                examples = cluster_data.head(num_examples)
+                
+                for idx, row in examples.iterrows():
+                    st.markdown(f"""
+                    <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 10px 0;'>
+                    <b>#{idx}</b><br>
+                    <i>{row['full_context']}</i><br>
+                    <small>Координаты: ({row['x']:.3f}, {row['y']:.3f}, {row['z']:.3f})</small>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Статистика по кластеру
+                st.markdown("**Топ-10 наиболее частотных слов в кластере:**")
+                cluster_lemmas = cluster_data["lemmatized_context"].str.split().explode().value_counts().head(10)
+                st.write(cluster_lemmas.to_dict())
 
 # --- ВКЛАДКА 5: Документация и Формулы ---
 with tab5:
@@ -419,7 +528,46 @@ with tab5:
     - $T_1, T_2$ — множества точек первой и второй аксиологем соответственно.
     """)
     
-    st.subheader("5. Векторизация и снижение размерности")
+    st.subheader("5. Метрики качества кластеризации")
+    st.markdown(r"""
+    ### Silhouette Score (Силуэтный коэффициент)
+    Оценивает качество кластеризации на основе компактности кластеров и расстояния между ними.
+    
+    $$ S = \frac{b - a}{\max(a, b)} $$
+    
+    Где:
+    - $a$ — среднее расстояние до других точек в том же кластере (компактность)
+    - $b$ — среднее расстояние до точек в ближайшем соседнем кластере (разделение)
+    
+    *Диапазон*: [-1, 1]. Чем выше, тем лучше. Значения > 0.5 указывают на хорошую кластеризацию.
+    
+    ### Davies-Bouldin Index
+    Оценивает среднее сходство между каждым кластером и его наиболее похожим кластером.
+    
+    $$ DB = \frac{1}{k} \sum_{i=1}^{k} \max_{j \neq i} \left( \frac{\sigma_i + \sigma_j}{d(c_i, c_j)} \right) $$
+    
+    Где:
+    - $k$ — число кластеров
+    - $\sigma_i$ — среднее расстояние от точек кластера $i$ до его центроида
+    - $d(c_i, c_j)$ — расстояние между центроидами кластеров $i$ и $j$
+    
+    *Интерпретация*: Чем меньше, тем лучше кластеризация.
+    
+    ### Calinski-Harabasz Score
+    Отношение межкластерной дисперсии к внутрикластерной.
+    
+    $$ CH = \frac{SS_B / (k-1)}{SS_W / (n-k)} $$
+    
+    Где:
+    - $SS_B$ — межкластерная сумма квадратов
+    - $SS_W$ — внутрикластерная сумма квадратов
+    - $n$ — общее число точек
+    - $k$ — число кластеров
+    
+    *Интерпретация*: Чем выше, тем лучше кластеризация.
+    """)
+    
+    st.subheader("6. Векторизация и снижение размерности")
     st.markdown(r"""
     1. **Лемматизация**: Приведение слов к начальной форме с помощью `Stanza`.
     2. **Эмбеддинг**: Преобразование текста в плотный вектор $v \in \mathbb{R}^{d}$ с помощью модели `cointegrated/rubert-tiny2`.
